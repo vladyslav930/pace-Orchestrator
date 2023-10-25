@@ -1,0 +1,13 @@
+version: 0.0
+os: windows
+hooks:
+  ApplicationStop:
+    - location: CD\appStop.ps1
+  BeforeInstall:
+    - location: CD\beforeInstall.ps1
+  AfterInstall:
+    - location: CD\afterInstall.ps1
+  ApplicationStart:
+    - location: CD\appStart.ps1
+  ValidateService:
+    - location: CD\validateService.ps1

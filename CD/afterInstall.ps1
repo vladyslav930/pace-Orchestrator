@@ -1,0 +1,1 @@
+Copy-Item -Recurse $PSScriptRoot\..\* -Destination C:\inetpub\CscGet.Labor\

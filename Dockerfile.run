@@ -1,0 +1,11 @@
+FROM mcr.microsoft.com/dotnet/core/runtime-deps:3.1
+WORKDIR /published
+COPY --from=pace-packages /published/. .
+
+# Default value in case if we didn`t specify attr during the build
+ARG InformationalVersion="1.0.0"
+ENV INFORMATIONAL_VERSION_INFO=$InformationalVersion
+
+WORKDIR ./web
+ENTRYPOINT ["./Dxc.Pace.Orchestrator.Host"]
+

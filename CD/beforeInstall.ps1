@@ -1,0 +1,1 @@
+Remove-Item -Force -Recurse C:\inetpub\CscGet.Labor\*

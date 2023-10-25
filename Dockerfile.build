@@ -1,0 +1,7 @@
+FROM pace-packages AS builder
+COPY --from=pace-base . /
+COPY . /Orchestrator
+WORKDIR /Orchestrator
+RUN rm -rf ../published && dotnet publish ./src/Dxc.Pace.Orchestrator.Host/Dxc.Pace.Orchestrator.Host.csproj \
+    -c release -o ../../../published/web --runtime linux-x64 \
+	&& rm -rf ../Orchestrator

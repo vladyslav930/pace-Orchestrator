@@ -1,0 +1,19 @@
+version: '3.2'
+services:
+  orchestartor:
+    container_name: dxc_orchestrator
+    env_file:
+     - .env
+    build:
+      context: .
+      args:
+        EXPOSED_PORT: 49556
+        EXPOSED_HOST: "*"
+    ports:
+      - 49556:49556
+    networks:
+      - "dxc_default"
+
+networks:
+  dxc_default:
+    external: true
