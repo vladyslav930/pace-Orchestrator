@@ -1,0 +1,504 @@
+variables:
+  VERSION_MAJOR_ID: 2
+  VERSION_MINOR_ID: 1
+  VERSION_SPRINT_ID: 61
+  PUBLISH_FOLDER_NAME: "PublishData"
+  DEPLOY_FOLDER_NAME: "Deploy"
+  DB_MIGRATIONS_PROJECT_NAME: "Dxc.Captn.Labor.Database.Migrations"
+  DB_MIGRATIONS_PROJECT_DEPLOY_FOLDER_NAME: "$PUBLISH_FOLDER_NAME/SqlMigrations"
+  WEB_PROJECT_DEPLOY_FOLDER_NAME: "$PUBLISH_FOLDER_NAME/Service"
+  NUGET_PACKAGE_FOLDER_NAME: "Nuget"
+  PROJECT_NAME: "Dxc.Get.Labor"
+  HOST_PROJECT_PATH: "./src/Dxc.Get.Labor.Host/Dxc.Get.Labor.Host.csproj"
+  DB_MIGRATIONS_PROJECT_PATH: "./src/Dxc.Captn.Labor.Database.Migrations/Dxc.Captn.Labor.Database.Migrations.csproj"
+  SOLUTION_NAME: "Dxc.Get.Labor.sln"
+  ASSEMBLY_VERSION: $VERSION_MAJOR_ID.$VERSION_SPRINT_ID.$VERSION_MINOR_ID.0
+  PACKAGE_VERSION: $VERSION_MAJOR_ID.$VERSION_SPRINT_ID.$VERSION_MINOR_ID.$CI_PIPELINE_ID
+  VERSION_BRANCH_INFO: "$VERSION_MAJOR_ID.$VERSION_SPRINT_ID.$VERSION_MINOR_ID.$CI_PIPELINE_ID $CI_COMMIT_REF_NAME $CI_COMMIT_SHA"
+  NEXUS_URL: http://nexusoss.evaluate-it.cloud:8081/repository
+  IAC_BRANCH: dev
+  DEPLOY_SCRIPT_URL: 'http://vm199251.projects.local/DXC/Tools/Dxc.Captn.CD/raw/dev/CI/deployment.ps1'
+  CD_COMPONENT_NAME: laborservice
+  CONSUL_HOST: http://192.168.240.253:8500
+  DEV_NEXUS_REPOSITORY: DXC-Labor
+  PRODUCTION_NEXUS_REPOSITORY: DXC-Labor-production
+  PRODUCTIONR2_NEXUS_REPOSITORY: DXC-Labor-productionr2
+  PRODUCTIONR21_NEXUS_REPOSITORY: DXC-Labor-productionr21
+  STAGING_NEXUS_REPOSITORY: DXC-Labor-staging
+
+stages:
+- build
+- test
+- package
+- deploy
+
+before_script:
+  - git prune
+  - >
+    switch ($CI_BUILD_REF_NAME) { 
+    "dev" { $NEXUS = $DEV_NEXUS_REPOSITORY } 
+    "production" { $NEXUS = $PRODUCTION_NEXUS_REPOSITORY }
+    "production-r2" { $NEXUS = $PRODUCTIONR2_NEXUS_REPOSITORY } 
+    "production-r21" { $NEXUS = $PRODUCTIONR21_NEXUS_REPOSITORY } 
+    "staging" { $NEXUS = $STAGING_NEXUS_REPOSITORY } 
+    default { $NEXUS  = "Feature1Env" }
+    }
+
+build:
+  stage: build
+  script:
+  - Write-Host "Build Labor Service"
+  - dotnet restore
+  - dotnet publish $HOST_PROJECT_PATH -c Release -o "../../$WEB_PROJECT_DEPLOY_FOLDER_NAME" -p:AssemblyVersion=$ASSEMBLY_VERSION -p:VersionPrefix=$ASSEMBLY_VERSION -p:FileVersion=$ASSEMBLY_VERSION -p:InformationalVersion=$VERSION_BRANCH_INFO
+  - dotnet publish $DB_MIGRATIONS_PROJECT_PATH -c Release -o "../../$DB_MIGRATIONS_PROJECT_DEPLOY_FOLDER_NAME" -p:AssemblyVersion=$ASSEMBLY_VERSION -p:VersionPrefix=$ASSEMBLY_VERSION -p:FileVersion=$ASSEMBLY_VERSION -p:InformationalVersion=$VERSION_BRANCH_INFO
+  artifacts:
+    expire_in: 1h
+    paths:
+    - $PUBLISH_FOLDER_NAME
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+unit_tests:
+  stage: test
+  script:
+  - ForEach ($folder in (Get-ChildItem -Path .\tests -Directory -Filter *.Tests)) { dotnet test $folder.FullName -p:AssemblyVersion=$ASSEMBLY_VERSION }
+  dependencies:
+  - build
+  only:
+  - branches
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+nexus_publish:
+  stage: package
+  script:
+  - Write-Host "$NEXUS"
+  - nuget pack .\$PROJECT_NAME.nuspec -OutputDirectory .\$NUGET_PACKAGE_FOLDER_NAME -Version "$PACKAGE_VERSION"
+  - dotnet nuget push .\$NUGET_PACKAGE_FOLDER_NAME\$PROJECT_NAME.$PACKAGE_VERSION.nupkg -k $NEXUS_API_KEY -s $NEXUS_URL/$NEXUS
+  - nuget pack .\$DB_MIGRATIONS_PROJECT_NAME.nuspec -OutputDirectory .\$NUGET_PACKAGE_FOLDER_NAME -Version "$PACKAGE_VERSION"
+  - dotnet nuget push .\$NUGET_PACKAGE_FOLDER_NAME\$DB_MIGRATIONS_PROJECT_NAME.$PACKAGE_VERSION.nupkg -k $NEXUS_API_KEY -s $NEXUS_URL/$NEXUS
+  artifacts:
+    expire_in: 1h
+    paths:
+    - $NUGET_PACKAGE_FOLDER_NAME
+  dependencies:
+  - build
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+.deploy: &deploy
+  script:
+  - $(Get-ChildItem Env:)
+  - $deploymentParams = @{}
+  - $deploymentParams["projectName"] = $PROJECT_NAME
+  - $deploymentParams["nexusRepository"] = $NEXUS
+  - $deploymentParams["artifactVersion"] = $PACKAGE_VERSION
+  - $deploymentParams["componentName"] = $CD_COMPONENT_NAME
+  - $deploymentParams["deploymentEnvironment"] = $DEPLOYMENT_ENVIRONMENT
+  - $deploymentParams["CAPTNIAC_BRANCH"] = $IAC_BRANCH
+  - Invoke-WebRequest -Uri $DEPLOY_SCRIPT_URL -Headers @{'PRIVATE-TOKEN' = "$DOWNLOAD_TOKEN"} -OutFile "deployment.ps1" -UseBasicParsing
+  - .\deployment.ps1 -deploymentParams $deploymentParams
+  - Import-Module .\CI\dbMigration.ps1
+  - Run-Migrations -ConsulHost $CONSUL_HOST -ConsulDC $CONSUL_DC -SqlMigrationsRepo "$NEXUS_URL/$NEXUS" -BackEndVersion $PACKAGE_VERSION
+  dependencies: []
+
+.docker: &docker
+  before_script:
+  - uname -a
+  script:
+  - docker login -u $DOCKER_USER -p $DOCKER_PASS $DOCKER_REGISTRY
+  - docker build --rm -t $DOCKER_REGISTRY/labor:$BRANCH.$VERSION_SPRINT_ID .
+  - docker push $DOCKER_REGISTRY/labor:$BRANCH.$VERSION_SPRINT_ID
+
+.kubernetes_deploy: &kubernetes_deploy
+  before_script:
+  - uname -a
+  script:
+  - helm repo add dxc.captn $CHART_REPOSITORY
+  - helm init --client-only
+  - helm upgrade --install --set base-configuration.serviceImage.env=$BRANCH --set base-configuration.serviceImage.sprint=$VERSION_SPRINT_ID $DEPLOYMENT_ENVIRONMENT-labor dxc.captn/labor --namespace=$DEPLOYMENT_ENVIRONMENT --wait
+
+.republish_db: &republish_db
+  stage: deploy
+  script:
+  - Import-Module .\CI\dbHelpers.ps1
+  - Remove-Database -Environment $DEPLOYMENT_ENVIRONMENT -ConsulHost $CONSUL_HOST -ConsulDC $CONSUL_DC
+  - Create-Database -Environment $DEPLOYMENT_ENVIRONMENT -ConsulHost $CONSUL_HOST -ConsulDC $CONSUL_DC
+  - Write-Host "$NEXUS"
+  - Import-Module .\CI\dbMigration.ps1
+  - Run-Migrations -ConsulHost $CONSUL_HOST -ConsulDC $CONSUL_DC -SqlMigrationsRepo "$NEXUS_URL/$NEXUS" -BackEndVersion $PACKAGE_VERSION
+  environment:
+    name: $DEPLOYMENT_ENVIRONMENT
+  dependencies: []
+
+docker_publish:
+  <<: *docker
+  stage: package
+  variables:
+    BRANCH: $CI_BUILD_REF_NAME
+  only:
+  - dev
+  - staging
+  - production
+  except:
+  - triggers
+  - pipelines
+  - schedules
+  tags:
+    - docker
+
+docker_publish_feature:
+  <<: *docker
+  stage: package
+  variables:
+    BRANCH: feature
+  when: manual
+  only:
+  - branches
+  environment:
+    name: feature
+  except:
+  - triggers
+  - pipelines
+  - schedules
+  tags:
+    - docker
+
+kubernetes_deploy_env14:
+  <<: *kubernetes_deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env14
+    BRANCH: feature
+  when: manual
+  only:
+  - branches
+  environment:
+    name: feature
+  except:
+  - triggers
+  - pipelines
+  - schedules
+  tags:
+    - helm
+
+kubernetes_deploy_env13:
+  <<: *kubernetes_deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env13
+    BRANCH: $CI_BUILD_REF_NAME
+  when: manual
+  only:
+  - dev
+  environment:
+    name: Development
+  except:
+  - triggers
+  - pipelines
+  - schedules
+  tags:
+    - helm
+
+kubernetes_deploy_env249:
+  <<: *kubernetes_deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env249
+    BRANCH: $CI_BUILD_REF_NAME
+  when: manual
+  only:
+  - dev
+  environment:
+    name: integration-dev
+  except:
+  - triggers
+  - pipelines
+  - schedules
+  tags:
+    - helm
+
+deploy_env13:
+  <<: *deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env13
+    CONSUL_DC: env13
+  only:
+  - dev
+  environment:
+    name: Development
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+republish_db_env13:
+  <<: *republish_db
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env13
+    CONSUL_DC: env13
+  only:
+    - dev
+  when: manual
+
+deploy_env11:
+  <<: *deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env11
+    CONSUL_DC: env11
+  only:
+  - production-r2
+  when: manual
+  environment:
+    name: preproduction-r2
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+deploy_env18:
+  <<: *deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env18
+    CONSUL_DC: env18
+  only:
+  - production-r2
+  when: manual
+  environment:
+    name: production-r2
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+deploy_env14:
+  <<: *deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env14
+    CONSUL_DC: env14
+  when: manual
+  only:
+  - branches
+  environment:
+    name: feature
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+republish_db_env14:
+  <<: *republish_db
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env14
+    CONSUL_DC: env14
+  only:
+  - branches
+  when: manual
+
+deploy_env249:
+  <<: *deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env249
+    CONSUL_DC: env249
+  only:
+  - dev
+  environment:
+    name: integration-dev
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+republish_db_env249:
+  <<: *republish_db
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env249
+    CONSUL_DC: env249
+  only:
+  - dev
+  when: manual
+
+deploy_env232:
+  <<: *deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env232
+    CONSUL_DC: env232
+  only:
+  - staging
+  - production-r21
+  environment:
+    name: integration-staging
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+republish_db_env232:
+  <<: *republish_db
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env232
+    CONSUL_DC: env232
+  only:
+  - staging
+  - production-r21
+  when: manual
+
+deploy_env77:
+  <<: *deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env77
+    CONSUL_DC: env77
+  only:
+  - staging
+  environment:
+    name: staging
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+republish_db_env77:
+  <<: *republish_db
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env77
+    CONSUL_DC: env77
+  only:
+  - staging
+  when: manual
+
+deploy_env92:
+  <<: *deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env92
+    CONSUL_DC: env92
+  when: manual
+  only:
+  - staging
+  environment:
+    name: staging
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+republish_db_env92:
+  <<: *republish_db
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env92
+    CONSUL_DC: env92
+  only:
+  - staging
+  when: manual
+
+deploy_env188:
+  <<: *deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env188
+    CONSUL_DC: env188
+  only:
+  - production-r21
+  environment:
+    name: env188
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+republish_db_env188:
+  <<: *republish_db
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env188
+    CONSUL_DC: env188
+  only:
+  - production-r21
+  when: manual
+
+deploy_env253:
+  <<: *deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env253
+    CONSUL_DC: env253
+  when: manual
+  only:
+  - production-r21
+  environment:
+    name: env253
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+republish_db_env253:
+  <<: *republish_db
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env253
+    CONSUL_DC: env253
+  only:
+  - production-r21
+  when: manual
+
+deploy_env250:
+  <<: *deploy
+  stage: deploy
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env250
+    CONSUL_DC: env250
+  when: manual
+  only:
+  - dev 
+  - staging
+  - production-r21
+  environment:
+    name: performance
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+republish_db_env250:
+  <<: *republish_db
+  variables:
+    DEPLOYMENT_ENVIRONMENT: env250
+    CONSUL_DC: env250
+  only:
+  - dev 
+  - staging
+  - production-r21
+  when: manual
+  except:
+  - triggers
+  - pipelines
+  - schedules
+
+deploy_app_trigger:
+  stage: deploy
+  script:
+  - if (!$LBVERSION) { $VERSION = $(nuget.exe  list $PROJECT_NAME -Source $NEXUS_URL/$NEXUS -AllVersions | Sort-Object).Split(' ')[-1] } else { $VERSION = $LBVERSION }
+  - if (!$AWS_DEPLOYMENT) { Write-Host "Missing environment variable! Nothing to deploy!"; Exit 0 }
+  - $ConsulDc = if ($CONSUL_DC) { $CONSUL_DC } else { "dc1" }
+  - mkdir $DEPLOY_FOLDER_NAME\AWS
+  - $PackagePath = "$DEPLOY_FOLDER_NAME\AWS" ; Write-Host "PackagePath:$PackagePath"
+  - nuget install -o $DEPLOY_FOLDER_NAME $PROJECT_NAME -Source "$NEXUS_URL/$NEXUS" -Version $VERSION
+  - Copy-Item -Recurse $DEPLOY_FOLDER_NAME\$PROJECT_NAME -Destination $DEPLOY_FOLDER_NAME\AWS
+  - CI\awsDeploy.ps1 -Version $VERSION -Region $AWS_REGION -AwsDeployment $AWS_DEPLOYMENT -BucketName $AWS_BUCKET_NAME -PackagePath $PackagePath
+  - Exit $LASTEXITCODE
+  only:
+  - triggers
+  environment:
+    name: AWS
